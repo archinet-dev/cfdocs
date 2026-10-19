@@ -1,0 +1,775 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.1.0"
+
+# Resolve paths relative to script location
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DATA_DIR="${CFDOCS_DATA:-$SCRIPT_DIR/data/en}"
+GUIDES_DIR="${CFDOCS_GUIDES:-$SCRIPT_DIR/guides/en}"
+INDEX_FILE="$DATA_DIR/index.json"
+
+# --- Dependency check ---
+
+check_jq() {
+    if ! command -v jq &>/dev/null; then
+        echo "Error: jq is required but not installed." >&2
+        echo "Install: brew install jq (macOS) | apt install jq (Debian/Ubuntu) | choco install jq (Windows)" >&2
+        exit 1
+    fi
+}
+
+# --- Help ---
+
+show_help() {
+    cat <<'EOF'
+cfdoc - ColdFusion/CFML documentation lookup
+
+Usage:
+  cfdoc <name>                     Full docs for a function, tag, or component
+  cfdoc lookup <name>              Same as above (explicit)
+  cfdoc brief <name> [name...]     One-screen summary: signature, return, engines, related
+  cfdoc syntax <name>              Show only syntax (tag, script, member forms)
+  cfdoc params <name>              Show only parameters/attributes
+  cfdoc engines <name>             Show only engine compatibility
+  cfdoc examples <name>            Show only code examples
+  cfdoc search <term>              Search names and descriptions (name hits first)
+  cfdoc list functions|tags|categories|guides|deprecated   List items of a type
+  cfdoc category <name>            List items in a category (e.g. array-functions)
+  cfdoc since <version>            Functions/tags added in a ColdFusion version (e.g. 2025)
+  cfdoc guide <name>               Display a guide (e.g. script, closures)
+
+Flags:
+  --json                Output raw JSON instead of formatted text
+  --engine <name>       Filter by engine: coldfusion (cf, acf), lucee, boxlang (bl), railo, openbd
+  -h, --help            Show this help
+  -v, --version         Show version and dataset date
+
+Examples:
+  cfdoc arrayAppend
+  cfdoc brief arrayAppend structKeyExists queryExecute
+  cfdoc cfhttp
+  cfdoc http                        Resolves to cfhttp
+  cfdoc search "parse json"
+  cfdoc list functions
+  cfdoc list deprecated             Deprecated, removed or discouraged on ColdFusion
+  cfdoc since 2025                  What ColdFusion 2025 added
+  cfdoc category string-functions
+  cfdoc syntax queryExecute
+  cfdoc params cfhttp
+  cfdoc examples arrayFilter
+  cfdoc engines arrayAppend
+  cfdoc guide script
+  cfdoc arrayAppend --json
+  cfdoc arrayAppend --engine lucee
+
+Environment:
+  CFDOCS_DATA    Override path to data/en directory
+  CFDOCS_GUIDES  Override path to guides/en directory
+EOF
+}
+
+show_version() {
+    local data_date="unknown" counts=""
+    if command -v git &>/dev/null && git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
+        data_date="$(git -C "$SCRIPT_DIR" log -1 --format=%cs -- data/en 2>/dev/null || echo unknown)"
+    fi
+    if [[ -f "$INDEX_FILE" ]] && command -v jq &>/dev/null; then
+        counts="$(jq -r '"\(.functions|length) functions, \(.tags|length) tags, \(.guides|length) guides"' "$INDEX_FILE" 2>/dev/null || true)"
+    fi
+    echo "cfdoc $VERSION (cfdocs.org data as of $data_date${counts:+; $counts})"
+}
+
+# Accept common engine aliases.
+normalize_engine() {
+    case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+        cf|acf|adobe|coldfusion) echo coldfusion ;;
+        bl|boxlang) echo boxlang ;;
+        lucee|railo|openbd|rustcfml) echo "$(echo "$1" | tr '[:upper:]' '[:lower:]')" ;;
+        *)
+            echo "Error: Unknown engine '$1'. Use: coldfusion, lucee, boxlang, railo, openbd, rustcfml" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- Argument parsing ---
+
+COMMAND=""
+ARG=""
+ARGS=()
+FLAG_JSON=false
+FLAG_ENGINE=""
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--version)
+                show_version
+                exit 0
+                ;;
+            --json)
+                FLAG_JSON=true
+                shift
+                ;;
+            --engine)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --engine requires a value (coldfusion, lucee, boxlang, railo, openbd)" >&2
+                    exit 1
+                fi
+                FLAG_ENGINE="$(normalize_engine "$2")"
+                shift 2
+                ;;
+            lookup|brief|search|list|category|syntax|params|engines|examples|since|guide)
+                if [[ -z "$COMMAND" ]]; then
+                    COMMAND="$1"
+                    shift
+                    if [[ $# -gt 0 && ! "$1" =~ ^-- ]]; then
+                        ARG="$1"
+                        shift
+                    fi
+                elif [[ -z "$ARG" ]]; then
+                    ARG="$1"
+                    shift
+                else
+                    ARGS+=("$1")
+                    shift
+                fi
+                ;;
+            -*)
+                echo "Error: Unknown flag '$1'. Use --help for usage." >&2
+                exit 1
+                ;;
+            *)
+                if [[ -z "$COMMAND" ]]; then
+                    # Bare name — treat as lookup
+                    COMMAND="lookup"
+                    ARG="$1"
+                    shift
+                elif [[ -z "$ARG" ]]; then
+                    ARG="$1"
+                    shift
+                elif [[ "$COMMAND" == "brief" ]]; then
+                    ARGS+=("$1")
+                    shift
+                else
+                    echo "Error: Unexpected argument '$1'. Use --help for usage." >&2
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$COMMAND" ]]; then
+        show_help
+        exit 0
+    fi
+    if [[ ${#ARGS[@]} -gt 0 && "$COMMAND" != "brief" ]]; then
+        echo "Error: Unexpected argument '${ARGS[0]}'. Only 'brief' takes several names." >&2
+        exit 1
+    fi
+}
+
+# --- Utility: resolve a doc file by name ---
+
+resolve_file() {
+    local name
+    name="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+    local file="$DATA_DIR/${name}.json"
+    if [[ -f "$file" ]]; then
+        echo "$file"
+        return 0
+    fi
+    # Try with cf prefix for tags
+    file="$DATA_DIR/cf${name}.json"
+    if [[ -f "$file" ]]; then
+        echo "$file"
+        return 0
+    fi
+    return 1
+}
+
+# --- Formatters ---
+
+format_lookup() {
+    local file="$1"
+    jq -r '
+        def engine_line:
+            to_entries[] |
+            "\(.key): \(
+                if .value.minimum_version != "" then "\(.value.minimum_version)+"
+                else "supported"
+                end
+            )\(
+                if .value.deprecated then " (deprecated in \(.value.deprecated))" else "" end
+            )\(
+                if .value.removed then " (removed in \(.value.removed))" else "" end
+            )\(
+                if .value.notes != "" then " — \(.value.notes)" else "" end
+            )";
+
+        def fmt_param:
+            "  \(.name) (\(.type // "any"))" +
+            (if .required then " [required]" else " [optional\(if .default != "" and .default != null then ", default: \(.default)" else "" end)]" end) +
+            (if .description != "" and .description != null then "\n    \(.description | split("\n") | join("\n    "))" else "" end) +
+            (if (.values // []) | length > 0 then "\n    Values: \(.values | map(tostring) | join(", "))" else "" end);
+
+        def fmt_example:
+            "  --- \(.title // "Example") ---" +
+            (if .description != "" and .description != null then "\n  \(.description)" else "" end) +
+            "\n\n\(.code | split("\n") | map("    " + .) | join("\n"))" +
+            (if .result != "" and .result != null then "\n\n  Result: \(.result | tostring)" else "" end);
+
+        .name + "\n" +
+        "Type: \(.type)\n" +
+        (if .returns then "Returns: \(.returns)\n" else "" end) +
+        (if .discouraged then "\n*** DISCOURAGED: \(.discouraged) ***\n" else "" end) +
+        "\nDescription:\n  \(.description | split("\n") | join("\n  "))\n" +
+        (if .syntax then "\nSyntax:\n  \(.syntax)\n" else "" end) +
+        (if .member then "\nMember Syntax:\n  \(.member)\n" else "" end) +
+        (if .script then "\nCFScript Syntax:\n  \(.script)\n" else "" end) +
+        (if (.params // []) | length > 0 then
+            "\nParameters:\n" + ([.params[] | fmt_param] | join("\n\n")) + "\n"
+        else "" end) +
+        (if .engines then
+            "\nEngines:\n  " + ([.engines | engine_line] | join("\n  ")) + "\n"
+        else "" end) +
+        (if (.related // []) | length > 0 then
+            "\nRelated: " + (.related | join(", ")) + "\n"
+        else "" end) +
+        (if (.links // []) | length > 0 then
+            "\nLinks:\n" + ([.links[] | "  \(.title // .url): \(.url)"] | join("\n")) + "\n"
+        else "" end) +
+        (if (.examples // []) | length > 0 then
+            "\nExamples:\n" + ([.examples[] | fmt_example] | join("\n\n")) + "\n"
+        else "" end)
+    ' "$file"
+}
+
+format_lookup_engine() {
+    local file="$1"
+    local engine="$2"
+    jq -r --arg engine "$engine" '
+        def fmt_param:
+            "  \(.name) (\(.type // "any"))" +
+            (if .required then " [required]" else " [optional\(if .default != "" and .default != null then ", default: \(.default)" else "" end)]" end) +
+            (if .description != "" and .description != null then "\n    \(.description | split("\n") | join("\n    "))" else "" end);
+
+        def fmt_example:
+            "  --- \(.title // "Example") ---" +
+            (if .description != "" and .description != null then "\n  \(.description)" else "" end) +
+            "\n\n\(.code | split("\n") | map("    " + .) | join("\n"))" +
+            (if .result != "" and .result != null then "\n\n  Result: \(.result | tostring)" else "" end);
+
+        if .engines[$engine] then
+            .name + "\n" +
+            "Type: \(.type)\n" +
+            (if .returns then "Returns: \(.returns)\n" else "" end) +
+            (if .discouraged then "\n*** DISCOURAGED: \(.discouraged) ***\n" else "" end) +
+            "\nDescription:\n  \(.description | split("\n") | join("\n  "))\n" +
+            (if .syntax then "\nSyntax:\n  \(.syntax)\n" else "" end) +
+            (if .member then "\nMember Syntax:\n  \(.member)\n" else "" end) +
+            (if .script then "\nCFScript Syntax:\n  \(.script)\n" else "" end) +
+            (if (.params // []) | length > 0 then
+                "\nParameters:\n" + ([.params[] | fmt_param] | join("\n\n")) + "\n"
+            else "" end) +
+            "\nEngine (\($engine)):\n" +
+            "  Minimum version: \(if (.engines[$engine].minimum_version // "") != "" then "\(.engines[$engine].minimum_version)+" else "any" end)\n" +
+            (if .engines[$engine].deprecated then "  Deprecated: \(.engines[$engine].deprecated)\n" else "" end) +
+            (if .engines[$engine].removed then "  Removed: \(.engines[$engine].removed)\n" else "" end) +
+            (if .engines[$engine].notes != "" and .engines[$engine].notes != null then "  Notes: \(.engines[$engine].notes)\n" else "" end) +
+            (if .engines[$engine].docs then "  Docs: \(.engines[$engine].docs)\n" else "" end) +
+            (if (.related // []) | length > 0 then
+                "\nRelated: " + (.related | join(", ")) + "\n"
+            else "" end) +
+            (if (.examples // []) | length > 0 then
+                "\nExamples:\n" + ([.examples[] | fmt_example] | join("\n\n")) + "\n"
+            else "" end)
+        else
+            "\(.name) is not supported on \($engine)."
+        end
+    ' "$file"
+}
+
+# --- Commands ---
+
+cmd_lookup() {
+    local name="$1"
+    local file
+    if ! file=$(resolve_file "$name"); then
+        echo "Error: No documentation found for '$name'." >&2
+        echo "Try: cfdoc search $name" >&2
+        exit 1
+    fi
+
+    if [[ "$FLAG_JSON" == true ]]; then
+        if [[ -n "$FLAG_ENGINE" ]]; then
+            jq --arg engine "$FLAG_ENGINE" '{name, type, description, syntax, member, script, returns, params, related, examples, engine_info: .engines[$engine]}' "$file"
+        else
+            cat "$file"
+        fi
+        return
+    fi
+
+    if [[ -n "$FLAG_ENGINE" ]]; then
+        format_lookup_engine "$file" "$FLAG_ENGINE"
+    else
+        format_lookup "$file"
+    fi
+}
+
+# One-screen summary, the cheapest lookup for an agent deciding what to call.
+format_brief() {
+    local file="$1"
+    jq -r --arg engine "$FLAG_ENGINE" '
+        def ver: if (.minimum_version // "") != "" then "\(.minimum_version)+" else "any" end;
+        def flags: (if .deprecated then " deprecated \(.deprecated)" else "" end)
+                 + (if .removed then " removed \(.removed)" else "" end);
+        def engine_summary:
+            if $engine != "" then
+                (if .engines[$engine] then "\($engine) \(.engines[$engine] | ver + flags)"
+                 else "not supported on \($engine)" end)
+            else
+                ([.engines // {} | to_entries[] | "\(.key) \(.value | ver + flags)"] | join(" · "))
+            end;
+        def first_line: (.description // "") | split("\n")[0] | gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "");
+
+        (.syntax // .name)
+        + (if .returns then " → \(.returns)" else "" end) + "\n"
+        + (if .member then "  member: \(.member)\n" else "" end)
+        + (if .script then "  script: \(.script)\n" else "" end)
+        + "  \(first_line)\n"
+        + (if .discouraged then "  DISCOURAGED: \(.discouraged)\n" else "" end)
+        + (if .engines then "  engines: \(engine_summary)\n" else "" end)
+        + (if (.params // []) | length > 0 then
+            "  params: " + ([.params[] | .name + (if .required then "" else "?" end)] | join(", ")) + "\n"
+          else "" end)
+        + (if (.related // []) | length > 0 then "  related: \(.related | join(", "))\n" else "" end)
+    ' "$file"
+}
+
+cmd_brief() {
+    local names=("$@") name file status=0 first=true
+    for name in "${names[@]}"; do
+        if ! file=$(resolve_file "$name"); then
+            echo "Error: No documentation found for '$name'. Try: cfdoc search $name" >&2
+            status=1
+            continue
+        fi
+        if [[ "$FLAG_JSON" == true ]]; then
+            jq -c '{name, type, syntax, member, script, returns, discouraged, engines, related,
+                    params: [(.params // [])[] | {name, required, type}],
+                    description: ((.description // "") | split("\n")[0])}' "$file"
+        else
+            format_brief "$file"
+        fi
+        first=false
+    done
+    return $status
+}
+
+cmd_examples() {
+    local name="$1"
+    local file
+    if ! file=$(resolve_file "$name"); then
+        echo "Error: No documentation found for '$name'." >&2
+        exit 1
+    fi
+
+    if [[ "$FLAG_JSON" == true ]]; then
+        jq '{name, examples}' "$file"
+        return
+    fi
+
+    jq -r '
+        def fmt_example:
+            "  --- \(.title // "Example") ---" +
+            (if .description != "" and .description != null then "\n  \(.description)" else "" end) +
+            "\n\n\(.code | split("\n") | map("    " + .) | join("\n"))" +
+            (if .result != "" and .result != null then "\n\n  Result: \(.result | tostring)" else "" end);
+
+        .name + "\n" +
+        (if (.examples // []) | length > 0 then
+            "\nExamples (\(.examples | length)):\n" + ([.examples[] | fmt_example] | join("\n\n")) + "\n"
+        else
+            "\nNo examples.\n"
+        end)
+    ' "$file"
+}
+
+# Items added in a given ColdFusion version (or another engine with --engine).
+cmd_since() {
+    local version="$1"
+    local engine="${FLAG_ENGINE:-coldfusion}"
+    local results
+    results=$(find "$DATA_DIR" -name '*.json' ! -name 'index.json' -print0 | \
+        xargs -0 jq -r --arg v "$version" --arg engine "$engine" '
+            select(.type != "listing") |
+            select((.engines[$engine].minimum_version // "") | ascii_downcase | startswith($v | ascii_downcase)) |
+            "\(.name) (\(.type)) — \((.description // "") | split("\n")[0])"
+        ' 2>/dev/null | sort -f)
+
+    if [[ "$FLAG_JSON" == true ]]; then
+        find "$DATA_DIR" -name '*.json' ! -name 'index.json' -print0 | \
+            xargs -0 jq -c --arg v "$version" --arg engine "$engine" '
+                select(.type != "listing") |
+                select((.engines[$engine].minimum_version // "") | ascii_downcase | startswith($v | ascii_downcase)) |
+                {name, type, minimum_version: .engines[$engine].minimum_version, description: ((.description // "") | split("\n")[0])}
+            ' 2>/dev/null | jq -s 'sort_by(.name)'
+        return
+    fi
+
+    if [[ -z "$results" ]]; then
+        echo "Nothing recorded as added in $engine $version."
+        echo "Known $engine versions: $(find "$DATA_DIR" -name '*.json' ! -name 'index.json' -print0 | xargs -0 jq -r --arg engine "$engine" '.engines[$engine].minimum_version // empty | select(. != "")' 2>/dev/null | sort -u | tr '\n' ' ')"
+        return 1
+    fi
+    echo "Added in $engine $version:"
+    echo ""
+    echo "$results"
+    echo ""
+    echo "$(echo "$results" | wc -l | tr -d ' ') item(s)."
+}
+
+cmd_search() {
+    local query
+    query="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+
+    if [[ "$FLAG_JSON" == true ]]; then
+        find "$DATA_DIR" -name '*.json' ! -name 'index.json' -print0 | \
+            xargs -0 jq -c --arg q "$query" '
+                select(.type != "listing") |
+                select(
+                    ((.name // "") | ascii_downcase | contains($q)) or
+                    ((.description // "") | ascii_downcase | contains($q))
+                ) |
+                {name, type, description: (.description | split("\n")[0])}
+            ' 2>/dev/null | jq -s '.'
+        return
+    fi
+
+    local count=0
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            echo "$line"
+            count=$((count + 1))
+        fi
+    done < <(
+        find "$DATA_DIR" -name '*.json' ! -name 'index.json' -print0 | \
+            xargs -0 jq -r --arg q "$query" --arg engine "$FLAG_ENGINE" '
+                select(.type != "listing") |
+                select(
+                    ((.name // "") | ascii_downcase | contains($q)) or
+                    ((.description // "") | ascii_downcase | contains($q))
+                ) |
+                if $engine != "" then
+                    select(.engines[$engine] != null)
+                else . end |
+                (if ((.name // "") | ascii_downcase | contains($q)) then "0" else "1" end)
+                + "\t\(.name) (\(.type)) — \(.description | split("\n")[0])"
+            ' 2>/dev/null | sort -f | cut -f2-
+    )
+
+    if [[ $count -eq 0 ]]; then
+        echo "No results found for '$1'."
+    else
+        echo ""
+        echo "$count result(s) found."
+    fi
+}
+
+cmd_list() {
+    local list_type="$1"
+
+    if [[ ! -f "$INDEX_FILE" ]]; then
+        echo "Error: Index file not found at $INDEX_FILE" >&2
+        exit 1
+    fi
+
+    case "$list_type" in
+        functions|function)
+            if [[ "$FLAG_JSON" == true ]]; then
+                jq '.functions' "$INDEX_FILE"
+            else
+                echo "Functions ($(jq '.functions | length' "$INDEX_FILE")):"
+                echo ""
+                jq -r '.functions[]' "$INDEX_FILE" | column
+            fi
+            ;;
+        tags|tag)
+            if [[ "$FLAG_JSON" == true ]]; then
+                jq '.tags' "$INDEX_FILE"
+            else
+                echo "Tags ($(jq '.tags | length' "$INDEX_FILE")):"
+                echo ""
+                jq -r '.tags[]' "$INDEX_FILE" | column
+            fi
+            ;;
+        categories|category)
+            if [[ "$FLAG_JSON" == true ]]; then
+                jq '.categories' "$INDEX_FILE"
+            else
+                echo "Categories ($(jq '.categories | length' "$INDEX_FILE")):"
+                echo ""
+                jq -r '.categories[]' "$INDEX_FILE"
+            fi
+            ;;
+        guides|guide)
+            if [[ "$FLAG_JSON" == true ]]; then
+                jq '.guides' "$INDEX_FILE"
+            else
+                echo "Guides ($(jq '.guides | length' "$INDEX_FILE")):"
+                echo ""
+                jq -r '.guides[]' "$INDEX_FILE"
+            fi
+            ;;
+        deprecated|discouraged)
+            local engine="${FLAG_ENGINE:-coldfusion}"
+            local filter='
+                select(.type != "listing") |
+                select(.discouraged or .engines[$engine].deprecated or .engines[$engine].removed)'
+            if [[ "$FLAG_JSON" == true ]]; then
+                find "$DATA_DIR" -name '*.json' ! -name 'index.json' -print0 | \
+                    xargs -0 jq -c --arg engine "$engine" "$filter"' |
+                        {name, type, discouraged, deprecated: .engines[$engine].deprecated, removed: .engines[$engine].removed}' 2>/dev/null | jq -s 'sort_by(.name)'
+            else
+                echo "Deprecated, removed or discouraged ($engine):"
+                echo ""
+                find "$DATA_DIR" -name '*.json' ! -name 'index.json' -print0 | \
+                    xargs -0 jq -r --arg engine "$engine" "$filter"' |
+                        "\(.name) (\(.type)) — " + ([
+                            (if .engines[$engine].removed then "removed in \(.engines[$engine].removed)" else empty end),
+                            (if .engines[$engine].deprecated then "deprecated in \(.engines[$engine].deprecated)" else empty end),
+                            (if .discouraged then "discouraged: \(.discouraged | split("\n")[0])" else empty end)
+                        ] | join("; "))' 2>/dev/null | sort -f
+            fi
+            ;;
+        *)
+            echo "Error: Unknown list type '$list_type'. Use: functions, tags, categories, guides, deprecated" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_category() {
+    local name
+    name="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+    local file="$DATA_DIR/${name}.json"
+
+    if [[ ! -f "$file" ]]; then
+        echo "Error: Category '$name' not found." >&2
+        echo "Try: cfdoc list categories" >&2
+        exit 1
+    fi
+
+    if [[ "$FLAG_JSON" == true ]]; then
+        cat "$file"
+        return
+    fi
+
+    local doc_type
+    doc_type=$(jq -r '.type' "$file")
+    if [[ "$doc_type" != "listing" ]]; then
+        echo "Error: '$name' is not a category listing (it's a $doc_type)." >&2
+        echo "Try: cfdoc lookup $name" >&2
+        exit 1
+    fi
+
+    jq -r '
+        "\(.name)\n\(.description)\n\nItems (\(.related | length)):\n" +
+        (.related | join("\n"))
+    ' "$file"
+}
+
+cmd_syntax() {
+    local name="$1"
+    local file
+    if ! file=$(resolve_file "$name"); then
+        echo "Error: No documentation found for '$name'." >&2
+        exit 1
+    fi
+
+    if [[ "$FLAG_JSON" == true ]]; then
+        jq '{name, syntax, member, script}' "$file"
+        return
+    fi
+
+    jq -r '
+        .name + "\n" +
+        (if .syntax then "\nSyntax:\n  \(.syntax)\n" else "" end) +
+        (if .member then "\nMember Syntax:\n  \(.member)\n" else "" end) +
+        (if .script then "\nCFScript Syntax:\n  \(.script)\n" else "" end)
+    ' "$file"
+}
+
+cmd_params() {
+    local name="$1"
+    local file
+    if ! file=$(resolve_file "$name"); then
+        echo "Error: No documentation found for '$name'." >&2
+        exit 1
+    fi
+
+    if [[ "$FLAG_JSON" == true ]]; then
+        jq '{name, params}' "$file"
+        return
+    fi
+
+    jq -r '
+        def fmt_param:
+            "  \(.name) (\(.type // "any"))" +
+            (if .required then " [required]" else " [optional\(if .default != "" and .default != null then ", default: \(.default)" else "" end)]" end) +
+            (if .description != "" and .description != null then "\n    \(.description | split("\n") | join("\n    "))" else "" end) +
+            (if (.values // []) | length > 0 then "\n    Values: \(.values | map(tostring) | join(", "))" else "" end);
+
+        .name + "\n" +
+        (if (.params // []) | length > 0 then
+            "\nParameters (\(.params | length)):\n" + ([.params[] | fmt_param] | join("\n\n")) + "\n"
+        else
+            "\nNo parameters.\n"
+        end)
+    ' "$file"
+}
+
+cmd_engines() {
+    local name="$1"
+    local file
+    if ! file=$(resolve_file "$name"); then
+        echo "Error: No documentation found for '$name'." >&2
+        exit 1
+    fi
+
+    if [[ "$FLAG_JSON" == true ]]; then
+        jq '{name, engines}' "$file"
+        return
+    fi
+
+    jq -r '
+        def engine_line:
+            to_entries[] |
+            "  \(.key):" +
+            "\n    Version: \(if .value.minimum_version != "" then "\(.value.minimum_version)+" else "any" end)" +
+            (if .value.deprecated then "\n    Deprecated: \(.value.deprecated)" else "" end) +
+            (if .value.removed then "\n    Removed: \(.value.removed)" else "" end) +
+            (if .value.notes != "" and .value.notes != null then "\n    Notes: \(.value.notes)" else "" end) +
+            (if .value.docs then "\n    Docs: \(.value.docs)" else "" end);
+
+        .name + "\n" +
+        (if .engines then
+            "\nEngines:\n" + ([.engines | engine_line] | join("\n")) + "\n"
+        else
+            "\nNo engine information available.\n"
+        end)
+    ' "$file"
+}
+
+cmd_guide() {
+    local name
+    name="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+    local file="$GUIDES_DIR/${name}.md"
+
+    if [[ ! -f "$file" ]]; then
+        echo "Error: Guide '$name' not found." >&2
+        echo "Try: cfdoc list guides" >&2
+        exit 1
+    fi
+
+    cat "$file"
+}
+
+# --- Main ---
+
+main() {
+    check_jq
+    parse_args "$@"
+
+    case "$COMMAND" in
+        lookup)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: lookup requires a name. Usage: cfdoc lookup <name>" >&2
+                exit 1
+            fi
+            cmd_lookup "$ARG"
+            ;;
+        brief)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: brief requires at least one name. Usage: cfdoc brief <name> [name...]" >&2
+                exit 1
+            fi
+            cmd_brief "$ARG" ${ARGS[@]+"${ARGS[@]}"}
+            ;;
+        examples)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: examples requires a name. Usage: cfdoc examples <name>" >&2
+                exit 1
+            fi
+            cmd_examples "$ARG"
+            ;;
+        since)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: since requires a version. Usage: cfdoc since <version> (e.g. 2025)" >&2
+                exit 1
+            fi
+            cmd_since "$ARG"
+            ;;
+        search)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: search requires a term. Usage: cfdoc search <term>" >&2
+                exit 1
+            fi
+            cmd_search "$ARG"
+            ;;
+        list)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: list requires a type. Usage: cfdoc list functions|tags|categories|guides" >&2
+                exit 1
+            fi
+            cmd_list "$ARG"
+            ;;
+        category)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: category requires a name. Usage: cfdoc category <name>" >&2
+                exit 1
+            fi
+            cmd_category "$ARG"
+            ;;
+        syntax)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: syntax requires a name. Usage: cfdoc syntax <name>" >&2
+                exit 1
+            fi
+            cmd_syntax "$ARG"
+            ;;
+        params)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: params requires a name. Usage: cfdoc params <name>" >&2
+                exit 1
+            fi
+            cmd_params "$ARG"
+            ;;
+        engines)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: engines requires a name. Usage: cfdoc engines <name>" >&2
+                exit 1
+            fi
+            cmd_engines "$ARG"
+            ;;
+        guide)
+            if [[ -z "$ARG" ]]; then
+                echo "Error: guide requires a name. Usage: cfdoc guide <name>" >&2
+                exit 1
+            fi
+            cmd_guide "$ARG"
+            ;;
+        *)
+            echo "Error: Unknown command '$COMMAND'. Use --help for usage." >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
